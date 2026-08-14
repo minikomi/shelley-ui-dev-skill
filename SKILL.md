@@ -93,6 +93,9 @@ rebuild/deploy; nothing from this loop leaks into it.
 - To seed realistic data in standalone mode, copy a database: `sqlite3
   <real.db> ".backup /tmp/uidev.db"` and pass `--db /tmp/uidev.db`.
 - If port 8003/8004 are busy, pass different ones.
+- Restart the workhorse after switching branches or hard-resetting the
+  checkout: git replacing directories under the running watcher leaves it
+  unable to spawn builds (spurious "Cannot find module .../build.js").
 - The backend embeds whatever `ui/dist` existed at its `go run`; nobody looks
   at those assets — the proxy serves fresh ones. A backend restart after many
   edits may hit the repo's stale-build check; the script always builds before
