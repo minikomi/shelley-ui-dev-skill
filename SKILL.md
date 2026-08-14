@@ -54,7 +54,39 @@ Other options: `--port`, `--backend-port`, `--db`, `--config <file>`, and
 `--real-models` (with `--config`) for a standalone workhorse backed by real
 models instead of the predictable fixture.
 
-## Iterate
+## The pipeline: how a UI change should flow
+
+Work in stages, with a visual checkpoint for the user at each gate. Do not
+skip ahead: each stage exists to catch a class of mistake cheaply.
+
+**1. Isolate.** Capture the component's markup from the live page and put it
+on the stage. Include the states that matter — active/inactive, disabled,
+long and short content — as separate labeled copies in one payload, so every
+later judgment sees all of them at once.
+
+**2. Explore.** Inject one stylesheet containing 3–6 clearly labeled
+variations (wrap each copy in `.v-<name>` and scope rules to it). Screenshot
+the stage, show the user, let THEM pick. Do not pre-narrow to one candidate;
+cheap variations are the point of the stage.
+
+**3. State matrix.** Re-stage the chosen variation across all captured
+states side by side and check consistency deliberately: font sizes equal
+across states, paddings equal, colors legible on every background, nothing
+clipped. Screenshot; user confirms.
+
+**4. Live preview.** POST the winning CSS to /__uidev__/css so it applies to
+the REAL app on the front port — same rules, now amid real data, real
+neighbors, real density. User checks in context. Surprises here go back to
+stage 3.
+
+**5. Source.** Write the rules into the real stylesheet, wait for `UI
+built`, CLEAR THE INJECTION, reload, and verify the from-source result looks
+identical to the approved preview. Run type-checks if TS/Vue changed.
+
+**6. Commit.** Only after the user approves the from-source check.
+
+
+## Iterate (mechanics)
 
 1. Pin the smallest stable selector for the component (a `data-testid`, a
    component class); screenshot that selector, not the whole page.
