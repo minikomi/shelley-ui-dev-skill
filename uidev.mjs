@@ -22,7 +22,7 @@
 // main instance — overlaying its UI with fresh assets from the checkout.
 
 import { spawn, spawnSync } from "node:child_process";
-import { watch, existsSync, statSync, createReadStream, readFileSync } from "node:fs";
+import { watch, existsSync, statSync, createReadStream, readFileSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import net from "node:net";
 import { join, resolve, extname, normalize } from "node:path";
@@ -115,6 +115,58 @@ for (const sig of ["SIGINT", "SIGTERM"]) process.on(sig, () => process.exit(0));
 const sseClients = new Set();
 let injectedCSS = "";
 
+// Component stage: POST markup to /__stage__/html and open /__stage__ — a
+// minimal page that renders just that markup against the real built
+// stylesheets. No Vue, no app, no state: stage pages auto-refresh on new
+// markup, on CSS injection, and on every dist rebuild. Capture markup from
+// the live page with browser eval:
+//   document.querySelector('.some-component').outerHTML
+// then POST it:
+//   curl -X POST --data-binary '<button class="send-split-main">hi</button>' localhost:8004/__stage__/html
+const STAGE_FILE = "/tmp/uidev-stage.html";
+let stageHTML = existsSync(STAGE_FILE) ? readFileSync(STAGE_FILE, "utf8") : "<p>POST markup to /__stage__/html</p>";
+
+// Notify stage pages when a build lands (they reload; the real app does not).
+let lastBuildStamp = "";
+function buildStamp() {
+  try { return statSync(join(distDir, "build-info.json")).mtimeMs + ""; } catch { return lastBuildStamp; }
+}
+lastBuildStamp = buildStamp();
+setInterval(() => {
+  const s = buildStamp();
+  if (s === lastBuildStamp) return;
+  lastBuildStamp = s;
+  for (const c of sseClients) c.write("event: build\ndata: 1\n\n");
+}, 500);
+
+function stagePage() {
+  // Use the same stylesheets, in the same order, as the real app.
+  let links = "";
+  try {
+    const idx = readFileSync(join(distDir, "index.html"), "utf8");
+    links = (idx.match(/<link[^>]*stylesheet[^>]*>/g) ?? []).join("\n");
+  } catch {}
+  return `<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>uidev stage</title>
+${links}
+<style>body{padding:2rem;background:var(--gray-50,#f9fafb)}.uidev-stage-bar{position:fixed;top:0;left:0;right:0;font:11px monospace;background:#111;color:#7c7;padding:2px 8px;z-index:99999}#stage{margin-top:2rem}</style>
+</head><body>
+<div class="uidev-stage-bar">uidev stage — markup: POST /__stage__/html · css: POST /__uidev__/css · auto-refreshes on rebuild</div>
+<div id="stage">${stageHTML}</div>
+<script>(function(){
+var s=new EventSource("/__uidev__/events");
+s.onmessage=function(e){
+  var el=document.getElementById("uidev-css");
+  if(!el){el=document.createElement("style");el.id="uidev-css";document.head.appendChild(el);}
+  el.textContent=JSON.parse(e.data);
+};
+s.addEventListener("stage",function(e){document.getElementById("stage").innerHTML=JSON.parse(e.data);});
+s.addEventListener("build",function(){location.reload();});
+})()</script>
+</body></html>`;
+}
+
 const INJECT_SNIPPET = `<script>(function(){
 function apply(css){
   var el=document.getElementById("uidev-css");
@@ -159,6 +211,23 @@ const server = http.createServer((req, res) => {
       injectedCSS = body;
       console.log(`[uidev] injected CSS ${body ? `(${body.length} bytes)` : "cleared"} → ${sseClients.size} page(s)`);
       for (const c of sseClients) c.write(`data: ${JSON.stringify(injectedCSS)}\n\n`);
+      res.writeHead(200);
+      res.end("ok\n");
+    });
+    return;
+  }
+  if (req.url === "/__stage__" || req.url.startsWith("/__stage__?")) {
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+    return res.end(stagePage());
+  }
+  if (req.url === "/__stage__/html" && req.method === "POST") {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      stageHTML = body || "<p>POST markup to /__stage__/html</p>";
+      try { writeFileSync(STAGE_FILE, stageHTML); } catch {}
+      console.log(`[uidev] stage markup set (${body.length} bytes) → ${sseClients.size} page(s)`);
+      for (const c of sseClients) c.write(`event: stage\ndata: ${JSON.stringify(stageHTML)}\n\n`);
       res.writeHead(200);
       res.end("ok\n");
     });

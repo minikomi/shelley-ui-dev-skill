@@ -77,6 +77,27 @@ models instead of the predictable fixture.
 4. Run `cd ui && pnpm run type-check && pnpm run type-check:vue` after TS/Vue
    changes, per the repo's AGENTS.md.
 
+## Component stage: isolate one component
+
+For quick-quick iteration on a single component, skip the app entirely.
+The proxy hosts a stage at `/__stage__`: a blank page that renders POSTed
+markup against the real built stylesheets. No Vue, no app state — so unlike
+the real app, stage pages auto-update on everything: new markup, CSS
+injection, and every dist rebuild.
+
+1. Capture the component's markup from the live page (browser eval):
+   `document.querySelector('.some-component').outerHTML`
+2. Stage it: `curl -X POST --data-binary '<div class="...">...</div>' localhost:8004/__stage__/html`
+3. Open `http://localhost:8004/__stage__` and iterate with `/__uidev__/css`
+   injections — each POST appears instantly, no reload. Tip: add
+   `transform:scale(2.5)` to the injection to zoom in on detail work.
+4. Interactive states can be faked in markup (add/remove `disabled`,
+   `class="active"`) since there is no JS behind the elements.
+5. Persist as usual: write rules into the real stylesheet; the stage reloads
+   itself when the watch rebuild lands, showing the from-source result.
+
+The staged markup survives proxy restarts (kept in /tmp/uidev-stage.html).
+
 ## Bring the changes back
 
 The edits are ordinary working-tree changes in the checkout — commit them as
