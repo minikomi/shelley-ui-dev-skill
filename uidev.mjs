@@ -14,7 +14,7 @@
 //
 // Usage: node uidev.mjs <checkout-dir> [--port 8004] [--backend-port 8003]
 //        [--db /tmp/shelley-ui-dev.db] [--config <file>] [--real-models]
-//        [--attach <port>]
+//        [--attach <port>] [--chat <conversation-id>]
 // Default is --predictable-only with a scratch DB, so it cannot disturb
 // real conversations and needs no model credentials. --real-models drops
 // --predictable-only (requires --config). --attach <port> spawns NO backend
@@ -22,10 +22,15 @@
 // main instance — overlaying its UI with fresh assets from the checkout.
 
 import { spawn, spawnSync } from "node:child_process";
-import { watch, existsSync, statSync, createReadStream, readFileSync, writeFileSync } from "node:fs";
+import { watch, existsSync, statSync, createReadStream, readFileSync, writeFileSync, mkdirSync, readdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { randomUUID } from "node:crypto";
+import { gunzipSync } from "node:zlib";
 import http from "node:http";
 import net from "node:net";
 import { join, resolve, extname, normalize } from "node:path";
+import { createLiveStages } from "./live-stages.mjs";
+import { proxyHttp } from "./http-proxy.mjs";
 
 const args = process.argv.slice(2);
 const checkout = resolve(args.find((a) => !a.startsWith("--")) ?? ".");
@@ -40,6 +45,7 @@ const DB = opt("--db", "/tmp/shelley-ui-dev.db");
 const CONFIG = opt("--config", null);
 const REAL = args.includes("--real-models");
 const USER = opt("--user", null); // inject X-Exedev-Userid for localhost callers when absent
+const CHAT = opt("--chat", null);
 
 const uiDir = join(checkout, "ui");
 const distDir = join(uiDir, "dist");
@@ -125,8 +131,23 @@ let injectedCSS = "";
 //   curl -X POST --data-binary '<button class="send-split-main">hi</button>' localhost:8004/__stage__/html
 const STAGE_FILE = "/tmp/uidev-stage.html";
 let stageHTML = existsSync(STAGE_FILE) ? readFileSync(STAGE_FILE, "utf8") : "<p>POST markup to /__stage__/html</p>";
+const SAVED_DIR = join(homedir(), ".local/share/shelley-ui-dev/stages");
+mkdirSync(SAVED_DIR, { recursive: true });
 
-// Notify stage pages when a build lands (they reload; the real app does not).
+function builtStageStyles() {
+  const index = readFileSync(join(distDir, "index.html"), "utf8");
+  return (index.match(/<link[^>]*stylesheet[^>]*>/g) ?? []).map((link) => {
+    const href = link.match(/href="([^"]+)"/)[1];
+    const file = join(distDir, href);
+    return existsSync(file) ? readFileSync(file, "utf8") : gunzipSync(readFileSync(file + ".gz")).toString();
+  }).join("\n");
+}
+
+function stageStyles() {
+  return builtStageStyles() + "\n" + injectedCSS;
+}
+
+// Notify stage pages when a build lands; they refresh styles without reloading.
 let lastBuildStamp = "";
 function buildStamp() {
   try { return statSync(join(distDir, "build-info.json")).mtimeMs + ""; } catch { return lastBuildStamp; }
@@ -137,32 +158,170 @@ setInterval(() => {
   if (s === lastBuildStamp) return;
   lastBuildStamp = s;
   for (const c of sseClients) c.write("event: build\ndata: 1\n\n");
+  liveStages.notifyBuild();
 }, 500);
 
-function stagePage() {
+function stagePage(url, frozenStyles = null, markup = stageHTML, workspace = null) {
+  const chat = workspace ? workspace.chat : new URL(url, "http://localhost").searchParams.get("chat") ?? CHAT;
+  const chatPath = chat ? `/c/${encodeURIComponent(chat)}` : null;
+  const label = workspace ? workspace.name.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])) : frozenStyles !== null ? "archived experiment" : "uidev stage — components · live preview";
   // Use the same stylesheets, in the same order, as the real app.
   let links = "";
   try {
     const idx = readFileSync(join(distDir, "index.html"), "utf8");
     links = (idx.match(/<link[^>]*stylesheet[^>]*>/g) ?? []).join("\n");
   } catch {}
+  if (frozenStyles !== null) links = `<style data-stage-archive>${frozenStyles.replace(/<\/style/gi, "<\\/style")}</style>`;
   return `<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>uidev stage</title>
 ${links}
-<style>body{padding:2rem;background:var(--gray-50,#f9fafb)}.uidev-stage-bar{position:fixed;top:0;left:0;right:0;font:11px monospace;background:#111;color:#7c7;padding:2px 8px;z-index:99999}#stage{margin-top:2rem}</style>
+${workspace ? `<style id="uidev-css">${workspace.css.replace(/<\/style/gi, "<\\/style")}</style>` : ""}
+<style>html,body{height:auto!important;min-height:100%!important;overflow:auto!important}body{padding:2rem;background:var(--gray-50,#f9fafb)}.uidev-stage-bar{position:fixed;top:0;left:0;right:0;font:11px monospace;background:#111;color:#7c7;padding:2px 8px;z-index:99999}#stage{margin-top:2rem}</style>
+<style>
+.uidev-stage-bar{display:flex;align-items:center;justify-content:space-between;min-height:36px;box-sizing:border-box;gap:12px}
+.uidev-stage-tools{display:flex;align-items:center;gap:12px;font:13px system-ui}
+.uidev-stage-tools a{color:inherit}
+#uidev-library summary{cursor:pointer;padding:6px 10px}
+#uidev-library-panel{position:absolute;top:36px;right:8px;width:min(360px,calc(100vw - 16px));padding:16px;box-sizing:border-box;background:white;color:#333;border:1px solid #ddd;box-shadow:0 8px 30px #0002;border-radius:0 0 8px 8px}
+#uidev-library-panel input{width:100%;padding:8px;margin-bottom:8px;box-sizing:border-box;border:1px solid #ddd;border-radius:4px;font:13px system-ui}
+#uidev-library-panel button{padding:6px 10px;cursor:pointer}
+#uidev-saved-list{display:grid;gap:8px;margin-top:16px;max-height:50vh;overflow:auto}
+#uidev-saved-list a{display:block;padding:8px;border:1px solid #eee;border-radius:4px;text-decoration:none}
+#uidev-saved-list small{display:block;color:#888;margin-top:4px}
+#uidev-save-status{font:12px system-ui;margin:8px 0 0}
+</style>
+${chatPath ? `<style>
+.uidev-stage-bar{display:flex;align-items:center;justify-content:space-between;min-height:36px;box-sizing:border-box}
+#uidev-chat-toggle{border:0;background:none;color:inherit;font:13px system-ui;cursor:pointer;padding:6px 10px}
+#uidev-chat{position:fixed;z-index:99998;top:36px;right:0;bottom:0;width:min(420px,100vw);display:flex;flex-direction:column;background:#fff;border-left:1px solid #ddd;box-shadow:-8px 0 30px #0002}
+#uidev-chat[hidden]{display:none}
+#uidev-chat header{padding:10px 14px;display:flex;justify-content:space-between;font:13px system-ui;color:#333;border-bottom:1px solid #ddd}
+#uidev-chat-close{border:0;background:none;cursor:pointer;font:18px system-ui;color:#333;margin-left:12px}
+#uidev-chat iframe{width:100%;flex:1;min-height:0;border:0;background:#fff}
+@media(min-width:701px){
+  body:has(#uidev-chat:not([hidden])) #stage{margin-right:420px}
+  #uidev-chat{box-shadow:none}
+}
+@media(max-width:700px){
+  .uidev-stage-bar>span{max-width:110px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .uidev-stage-bar{top:var(--uidev-viewport-top,0px)}
+  body{padding:16px}
+  #uidev-chat{top:calc(var(--uidev-viewport-top,0px) + var(--uidev-viewport-height,100dvh)*.5);bottom:auto;width:100%;height:calc(var(--uidev-viewport-height,100dvh)*.5);border-left:0;border-top:1px solid #ddd;border-radius:14px 14px 0 0;overflow:hidden;box-shadow:0 -6px 24px #0002}
+  #uidev-chat header{padding:8px 12px}
+  body:has(#uidev-chat:not([hidden])){height:var(--uidev-viewport-height,100dvh)!important;min-height:0!important;overflow:hidden!important;padding:0}
+  body:has(#uidev-chat:not([hidden])) #stage{position:fixed;top:calc(var(--uidev-viewport-top,0px) + 36px);left:0;right:0;margin:0;padding:16px;box-sizing:border-box;height:calc(var(--uidev-viewport-height,100dvh)*.5 - 36px);overflow:auto;overscroll-behavior:contain}
+}
+</style>` : ""}
 </head><body>
-<div class="uidev-stage-bar">uidev stage — markup: POST /__stage__/html · css: POST /__uidev__/css · auto-refreshes on rebuild</div>
-<div id="stage">${stageHTML}</div>
+<div class="uidev-stage-bar"><span>${label}</span><div class="uidev-stage-tools">
+${frozenStyles !== null ? '<a href="/__stage__">Live stage ↗</a>' : ""}
+<details id="uidev-library"><summary>Stages</summary><div id="uidev-library-panel">
+<input id="uidev-stage-name" aria-label="Stage name" placeholder="Name this stage"><button id="uidev-save" type="button">${workspace ? "Fork stage" : frozenStyles !== null ? "Make live stage" : "Keep as live stage"}</button><p id="uidev-save-status" role="status"></p>
+<div id="uidev-saved-list"></div></div></details>
+${chatPath ? `<button id="uidev-chat-toggle" type="button" aria-controls="uidev-chat" aria-expanded="false" aria-label="Open stage chat">☰ Chat</button>` : ""}</div></div>
+<div id="stage">${markup}</div>
+${chatPath ? `<aside id="uidev-chat" hidden aria-label="Stage chat"><header><span>Stage chat</span><span><a href="${chatPath}" target="_blank" rel="noopener">Open separately ↗</a><button id="uidev-chat-close" type="button" aria-label="Close stage chat">×</button></span></header><iframe title="Shelley stage chat" src="${chatPath}"></iframe></aside>` : ""}
 <script>(function(){
-var s=new EventSource("/__uidev__/events");
+var liveStage=${JSON.stringify(workspace ? { id: workspace.id, name: workspace.name } : null).replace(/</g, "\\u003c")};
+var library=document.getElementById("uidev-library");
+async function loadStages(){
+  var responses=await Promise.all([fetch("/__stage__/live"),fetch("/__stage__/saved")]);
+  if(responses.some(function(response){return !response.ok;}))throw new Error("Could not load stages");
+  var stages=await responses[0].json(),archives=await responses[1].json();
+  var list=document.getElementById("uidev-saved-list");
+  list.replaceChildren();
+  if(!stages.length)list.textContent="No live stages yet.";
+  function stageLink(stage,path){
+    var link=document.createElement("a");
+    link.href=path+stage.id;
+    link.target="_blank";link.rel="noopener";
+    link.textContent=stage.name;
+    var date=document.createElement("small");
+    date.textContent=new Date(stage.createdAt).toLocaleString();
+    link.appendChild(date);
+    return link;
+  }
+  stages.forEach(function(stage){
+    list.appendChild(stageLink(stage,"/__stage__/live/"));
+  });
+  if(archives.length){
+    var details=document.createElement("details"),summary=document.createElement("summary");
+    summary.textContent="Archived experiments";details.appendChild(summary);
+    archives.forEach(function(stage){details.appendChild(stageLink(stage,"/__stage__/saved/"));});
+    list.appendChild(details);
+  }
+}
+library.addEventListener("toggle",function(){
+  if(library.open)loadStages().catch(function(error){document.getElementById("uidev-saved-list").textContent=error.message;});
+});
+var save=document.getElementById("uidev-save");
+if(save){
+  var name=document.getElementById("uidev-stage-name");
+  name.value=liveStage?liveStage.name:document.querySelector("#stage h1,#stage h2")?.textContent||"Component stage";
+  save.onclick=async function(){
+    save.disabled=true;
+    var status=document.getElementById("uidev-save-status");
+    try{
+      status.textContent="Creating a live stage and its chat…";
+      var style=document.querySelector("style[data-stage-archive]")||document.getElementById("uidev-css");
+      var response=await fetch("/__stage__/live",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:name.value,html:document.getElementById("stage").innerHTML,css:style?style.textContent:""})});
+      if(!response.ok)throw new Error(await response.text());
+      var stage=await response.json();
+      location.href="/__stage__/live/"+stage.id;
+    }catch(error){status.textContent=error.message;}
+    finally{save.disabled=false;}
+  };
+}
+var chat=document.getElementById("uidev-chat");
+if(chat){
+  var toggle=document.getElementById("uidev-chat-toggle");
+  function sizeViewport(){
+    var viewport=window.visualViewport;
+    document.documentElement.style.setProperty("--uidev-viewport-height",(viewport?viewport.height:window.innerHeight)+"px");
+    document.documentElement.style.setProperty("--uidev-viewport-top",(viewport?viewport.offsetTop:0)+"px");
+  }
+  sizeViewport();
+  window.addEventListener("resize",sizeViewport);
+  if(window.visualViewport){
+    window.visualViewport.addEventListener("resize",sizeViewport);
+    window.visualViewport.addEventListener("scroll",sizeViewport);
+  }
+  function showChat(open){
+    chat.hidden=!open;
+    toggle.setAttribute("aria-expanded",String(open));
+    toggle.setAttribute("aria-label",open?"Close stage chat":"Open stage chat");
+    if(!open)toggle.focus();
+  }
+  toggle.onclick=function(){showChat(chat.hidden);};
+  document.getElementById("uidev-chat-close").onclick=function(){showChat(false);};
+  function escapeChat(e){if(e.key==="Escape"&&!chat.hidden)showChat(false);}
+  document.addEventListener("keydown",escapeChat);
+  chat.querySelector("iframe").addEventListener("load",function(){
+    this.contentDocument.addEventListener("keydown",escapeChat);
+  });
+}
+${frozenStyles !== null ? "return;" : ""}
+var s=new EventSource(liveStage?"/__stage__/live/"+liveStage.id+"/events":"/__uidev__/events");
 s.onmessage=function(e){
   var el=document.getElementById("uidev-css");
   if(!el){el=document.createElement("style");el.id="uidev-css";document.head.appendChild(el);}
   el.textContent=JSON.parse(e.data);
 };
 s.addEventListener("stage",function(e){document.getElementById("stage").innerHTML=JSON.parse(e.data);});
-s.addEventListener("build",function(){location.reload();});
+s.addEventListener("build",async function(){
+  var response=await fetch(location.href);
+  if(!response.ok)throw new Error("Stage refresh failed: "+response.status);
+  var page=new DOMParser().parseFromString(await response.text(),"text/html");
+  var links=Array.from(page.querySelectorAll('link[rel="stylesheet"]'));
+  document.querySelectorAll('link[rel="stylesheet"]').forEach(function(el){el.remove();});
+  links.forEach(function(el){
+    var url=new URL(el.getAttribute("href"),location.href);
+    url.searchParams.set("uidev-build",Date.now());
+    el.href=url.href;
+    document.head.insertBefore(el,document.head.querySelector("style"));
+  });
+});
 })()</script>
 </body></html>`;
 }
@@ -196,7 +355,46 @@ function distFile(urlPath, accept) {
   return null;
 }
 
+const liveStages = createLiveStages({
+  checkout, port: PORT, backend: BACKEND, user: USER,
+  builtStyles: builtStageStyles,
+  render: (workspace, url) => stagePage(url, null, workspace.html, workspace),
+});
+
 const server = http.createServer((req, res) => {
+  if (liveStages.handle(req, res)) return;
+  if (req.url === "/__stage__/saved" && req.method === "GET") {
+    const stages = readdirSync(SAVED_DIR).filter((file) => file.endsWith(".json")).map((file) => {
+      const { id, name, createdAt } = JSON.parse(readFileSync(join(SAVED_DIR, file), "utf8"));
+      return { id, name, createdAt };
+    }).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+    return res.end(JSON.stringify(stages));
+  }
+  if (req.url === "/__stage__/saved" && req.method === "POST") {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      try {
+        const name = JSON.parse(body).name?.trim();
+        if (!name) { res.writeHead(400); return res.end("Name this stage before saving."); }
+        const id = randomUUID();
+        const snapshot = { id, name, createdAt: new Date().toISOString(), html: stageHTML, css: stageStyles() };
+        writeFileSync(join(SAVED_DIR, id + ".json"), JSON.stringify(snapshot));
+        res.writeHead(201, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ id, name, createdAt: snapshot.createdAt }));
+      } catch (error) { res.writeHead(500); res.end(error.message); }
+    });
+    return;
+  }
+  const saved = req.url.match(/^\/__stage__\/saved\/([a-f0-9-]{36})(?:\?.*)?$/);
+  if (saved && req.method === "GET") {
+    const file = join(SAVED_DIR, saved[1] + ".json");
+    if (!existsSync(file)) { res.writeHead(404); return res.end("Saved stage not found."); }
+    res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
+    const snapshot = JSON.parse(readFileSync(file, "utf8"));
+    return res.end(stagePage(req.url, snapshot.css, snapshot.html));
+  }
   if (req.url === "/__uidev__/events") {
     res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-store", Connection: "keep-alive" });
     res.write(`data: ${JSON.stringify(injectedCSS)}\n\n`); // current injection on connect
@@ -218,7 +416,7 @@ const server = http.createServer((req, res) => {
   }
   if (req.url === "/__stage__" || req.url.startsWith("/__stage__?")) {
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" });
-    return res.end(stagePage());
+    return res.end(stagePage(req.url));
   }
   if (req.url === "/__stage__/html" && req.method === "POST") {
     let body = "";
@@ -253,12 +451,7 @@ const server = http.createServer((req, res) => {
   }
   const headers = { ...req.headers };
   if (USER && !headers["x-exedev-userid"]) headers["x-exedev-userid"] = USER;
-  const up = http.request(
-    { host: "127.0.0.1", port: BACKEND, path: req.url, method: req.method, headers },
-    (ur) => { res.writeHead(ur.statusCode, ur.headers); ur.pipe(res); },
-  );
-  up.on("error", () => { res.writeHead(502); res.end("backend not ready"); });
-  req.pipe(up);
+  proxyHttp(req, res, { host: "127.0.0.1", port: BACKEND, headers });
 });
 
 // WebSocket (terminals) pass-through.
